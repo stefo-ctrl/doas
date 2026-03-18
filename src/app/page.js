@@ -26,6 +26,14 @@ function daysAgo(n) {
   return isoDate(d);
 }
 
+function computeStats(arr) {
+  const total = arr.reduce((s, c) => s + c.value, 0);
+  const suppliers = new Set(arr.map(c => c.supplier).filter(Boolean));
+  const limited = arr.filter(c => c.method === 'limited');
+  const pct = arr.length > 0 ? (limited.length / arr.length * 100) : 0;
+  return { total, count: arr.length, suppliers: suppliers.size, limitedPct: pct, limitedCount: limited.length };
+}
+
 const PAGE_SIZE = 50;
 
 export default function Home() {
@@ -43,6 +51,16 @@ export default function Home() {
   const [page, setPage] = useState(0);
   const [selectedId, setSelectedId] = useState(null);
   const [activeRange, setActiveRange] = useState(30);
+
+  // Are any filters active?
+  const isFiltered = search !== '' || agencyFilter !== '';
+
+  // Clear all filters
+  function clearFilters() {
+    setSearch('');
+    setAgencyFilter('');
+    setPage(0);
+  }
 
   // Fetch from our own API route
   const fetchContracts = useCallback(async (f, t) => {
@@ -96,8 +114,8 @@ export default function Home() {
     else { setSortCol(col); setSortDir('desc'); }
   }
 
-  // Filtered + sorted
-  const filtered = useMemo(() => {
+  // Filtered (search + agency) — unsorted, used for stats & charts
+  const filteredUnsorted = useMemo(() => {
     let arr = contracts;
     if (search) {
       const q = search.toLowerCase();
@@ -111,7 +129,12 @@ export default function Home() {
     if (agencyFilter) {
       arr = arr.filter(c => c.agency === agencyFilter);
     }
-    arr = [...arr].sort((a, b) => {
+    return arr;
+  }, [contracts, search, agencyFilter]);
+
+  // Filtered + sorted — used for table display
+  const filtered = useMemo(() => {
+    return [...filteredUnsorted].sort((a, b) => {
       let av, bv;
       switch (sortCol) {
         case 'value': return sortDir === 'desc' ? b.value - a.value : a.value - b.value;
@@ -127,44 +150,42 @@ export default function Home() {
         default: return sortDir === 'desc' ? b.value - a.value : a.value - b.value;
       }
     });
-    return arr;
-  }, [contracts, search, agencyFilter, sortCol, sortDir]);
+  }, [filteredUnsorted, sortCol, sortDir]);
 
-  // Hero stats
-  const heroStats = useMemo(() => {
-    const total = contracts.reduce((s, c) => s + c.value, 0);
-    const suppliers = new Set(contracts.map(c => c.supplier).filter(Boolean));
-    const limited = contracts.filter(c => c.method === 'limited');
-    const pct = contracts.length > 0 ? (limited.length / contracts.length * 100) : 0;
-    return { total, count: contracts.length, suppliers: suppliers.size, limitedPct: pct, limitedCount: limited.length };
-  }, [contracts]);
+  // Hero stats — derived from FILTERED data so they react to search/agency
+  const heroStats = useMemo(() => computeStats(filteredUnsorted), [filteredUnsorted]);
 
-  // Agencies for filter dropdown
+  // Total stats (unfiltered) — for "of X total" comparison
+  const totalStats = useMemo(() => computeStats(contracts), [contracts]);
+
+  // Agencies for filter dropdown (always from full set)
   const agencies = useMemo(() =>
     [...new Set(contracts.map(c => c.agency).filter(Boolean))].sort(),
     [contracts]
   );
 
+  // --- All chart breakdowns derive from filteredUnsorted ---
+
   // Agency breakdown for charts
   const agencyBreakdown = useMemo(() => {
     const m = {};
-    contracts.forEach(c => { const a = c.agency || 'Unknown'; m[a] = (m[a] || 0) + c.value; });
+    filteredUnsorted.forEach(c => { const a = c.agency || 'Unknown'; m[a] = (m[a] || 0) + c.value; });
     return Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, 10);
-  }, [contracts]);
+  }, [filteredUnsorted]);
 
   // Method breakdown for charts
   const methodBreakdown = useMemo(() => {
     const m = {};
-    contracts.forEach(c => { const k = c.method || 'unknown'; if (!m[k]) m[k] = { n: 0, v: 0 }; m[k].n++; m[k].v += c.value; });
+    filteredUnsorted.forEach(c => { const k = c.method || 'unknown'; if (!m[k]) m[k] = { n: 0, v: 0 }; m[k].n++; m[k].v += c.value; });
     return Object.entries(m).sort((a, b) => b[1].v - a[1].v);
-  }, [contracts]);
+  }, [filteredUnsorted]);
 
   // Top suppliers for charts
   const supplierBreakdown = useMemo(() => {
     const m = {};
-    contracts.forEach(c => { const s = c.supplier || 'Unknown'; if (!m[s]) m[s] = { n: 0, v: 0 }; m[s].n++; m[s].v += c.value; });
+    filteredUnsorted.forEach(c => { const s = c.supplier || 'Unknown'; if (!m[s]) m[s] = { n: 0, v: 0 }; m[s].n++; m[s].v += c.value; });
     return Object.entries(m).sort((a, b) => b[1].v - a[1].v).slice(0, 10);
-  }, [contracts]);
+  }, [filteredUnsorted]);
 
   // Value distribution
   const valueDist = useMemo(() => {
@@ -174,13 +195,13 @@ export default function Home() {
       { label: '$1M–$10M', min: 1e6, max: 1e7, n: 0, v: 0 },
       { label: 'Under $1M', min: 0, max: 1e6, n: 0, v: 0 },
     ];
-    contracts.forEach(c => {
+    filteredUnsorted.forEach(c => {
       for (const b of buckets) {
         if (c.value >= b.min && (!b.max || c.value < b.max)) { b.n++; b.v += c.value; break; }
       }
     });
     return buckets;
-  }, [contracts]);
+  }, [filteredUnsorted]);
 
   // Pagination
   const totalPages = Math.ceil(filtered.length / PAGE_SIZE);
@@ -242,27 +263,65 @@ export default function Home() {
         </div>
       </div>
 
+      {/* ACTIVE FILTER BANNER — only visible when filtering */}
+      {isFiltered && !loading && (
+        <div className="px-7 py-2 bg-gray-900 text-white flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] uppercase tracking-wide font-medium opacity-60">Showing</span>
+            {agencyFilter && (
+              <span className="text-[12px] font-semibold">{agencyFilter}</span>
+            )}
+            {search && (
+              <span className="text-[12px] font-semibold">
+                {agencyFilter ? ' matching ' : ''}&ldquo;{search}&rdquo;
+              </span>
+            )}
+            <span className="text-[11px] opacity-50">
+              — {filteredUnsorted.length.toLocaleString()} of {contracts.length.toLocaleString()} contracts
+            </span>
+          </div>
+          <button onClick={clearFilters}
+            className="text-[10px] font-medium px-2.5 py-1 rounded border border-white/30 hover:bg-white/10 transition-colors">
+            Clear filters
+          </button>
+        </div>
+      )}
+
       {/* HERO STATS */}
       <div className="grid grid-cols-4 border-b border-gray-200 max-md:grid-cols-2 max-sm:grid-cols-1">
         <div className="px-7 py-5 border-r border-gray-200 max-sm:border-r-0">
           <div className="text-[10px] text-gray-400 uppercase tracking-[1.4px] font-medium mb-0.5">Total Contract Value</div>
           <div className="text-[26px] font-bold tracking-tight tabnum">{loading ? '…' : fmtCurrency(heroStats.total)}</div>
-          <div className="text-[11px] text-gray-400 mt-0.5">{meta ? `${meta.from} → ${meta.to}` : ''}</div>
+          <div className="text-[11px] text-gray-400 mt-0.5">
+            {isFiltered && !loading
+              ? `of ${fmtCurrency(totalStats.total)} total`
+              : meta ? `${meta.from} → ${meta.to}` : ''}
+          </div>
         </div>
         <div className="px-7 py-5 border-r border-gray-200 max-sm:border-r-0">
           <div className="text-[10px] text-gray-400 uppercase tracking-[1.4px] font-medium mb-0.5">Contracts Published</div>
           <div className="text-[26px] font-bold tracking-tight tabnum">{loading ? '…' : heroStats.count.toLocaleString()}</div>
-          <div className="text-[11px] text-gray-400 mt-0.5">published in period</div>
+          <div className="text-[11px] text-gray-400 mt-0.5">
+            {isFiltered && !loading
+              ? `of ${totalStats.count.toLocaleString()} total`
+              : 'published in period'}
+          </div>
         </div>
         <div className="px-7 py-5 border-r border-gray-200 max-sm:border-r-0">
           <div className="text-[10px] text-gray-400 uppercase tracking-[1.4px] font-medium mb-0.5">Unique Suppliers</div>
           <div className="text-[26px] font-bold tracking-tight tabnum">{loading ? '…' : heroStats.suppliers.toLocaleString()}</div>
-          <div className="text-[11px] text-gray-400 mt-0.5">distinct entities</div>
+          <div className="text-[11px] text-gray-400 mt-0.5">
+            {isFiltered && !loading
+              ? `of ${totalStats.suppliers.toLocaleString()} total`
+              : 'distinct entities'}
+          </div>
         </div>
         <div className="px-7 py-5">
           <div className="text-[10px] text-gray-400 uppercase tracking-[1.4px] font-medium mb-0.5">Limited Tender %</div>
           <div className="text-[26px] font-bold tracking-tight tabnum">{loading ? '…' : heroStats.limitedPct.toFixed(1) + '%'}</div>
-          <div className="text-[11px] text-gray-400 mt-0.5">{heroStats.limitedCount.toLocaleString()} of {heroStats.count.toLocaleString()} no competitive bid</div>
+          <div className="text-[11px] text-gray-400 mt-0.5">
+            {heroStats.limitedCount.toLocaleString()} of {heroStats.count.toLocaleString()} no competitive bid
+          </div>
         </div>
       </div>
 
@@ -294,7 +353,15 @@ export default function Home() {
               <option value="">All Agencies</option>
               {agencies.map(a => <option key={a} value={a}>{a.replace(/^Department of /, '')}</option>)}
             </select>
-            <span className="ml-auto text-[11px] text-gray-400 tabnum">{filtered.length.toLocaleString()} contracts</span>
+            {isFiltered && (
+              <button onClick={clearFilters}
+                className="text-[10px] font-medium text-gray-500 hover:text-gray-900 px-2 py-1 border border-gray-200 rounded bg-white hover:border-gray-400 transition-colors">
+                Clear
+              </button>
+            )}
+            <span className="ml-auto text-[11px] text-gray-400 tabnum">
+              {filtered.length.toLocaleString()} {isFiltered ? `of ${contracts.length.toLocaleString()} ` : ''}contracts
+            </span>
           </div>
 
           {loading ? (
@@ -369,15 +436,22 @@ export default function Home() {
       {/* ANALYTICS TAB */}
       {tab === 'charts' && (
         <div className="p-7 grid grid-cols-2 gap-6 max-md:grid-cols-1">
+          {/* Show filter context in analytics too */}
+          {isFiltered && (
+            <div className="col-span-full text-[11px] text-gray-500 flex items-center gap-2 mb-1">
+              <span>Analytics for {agencyFilter ? agencyFilter : 'filtered results'}{search ? ` matching "${search}"` : ''}</span>
+              <button onClick={clearFilters} className="text-gray-400 hover:text-gray-900 underline">Show all</button>
+            </div>
+          )}
           <ChartCard title="Top Agencies by Value" data={agencyBreakdown}
             format={([name, val]) => ({ label: name.replace(/^Department of /, '').replace(/^Australian /, ''), value: val, display: fmtCurrency(val) })}
             maxVal={agencyBreakdown[0]?.[1] || 1} color="#111" />
           <ChartCard title="Procurement Method" data={methodBreakdown}
             format={([m, d]) => ({
               label: m === 'open' ? 'Open Tender' : m === 'limited' ? 'Limited Tender' : m === 'selective' ? 'Selective' : m,
-              value: d.n, display: `${d.n.toLocaleString()} (${(d.n / (contracts.length || 1) * 100).toFixed(0)}%)`,
+              value: d.n, display: `${d.n.toLocaleString()} (${(d.n / (filteredUnsorted.length || 1) * 100).toFixed(0)}%)`,
             })}
-            maxVal={contracts.length || 1}
+            maxVal={filteredUnsorted.length || 1}
             colorFn={([m]) => m === 'limited' ? '#d97706' : m === 'open' ? '#16a34a' : '#2563eb'} />
           <ChartCard title="Top Suppliers by Value" data={supplierBreakdown}
             format={([name, d]) => ({ label: name.length > 24 ? name.slice(0, 24) + '…' : name, value: d.v, display: fmtCurrency(d.v), title: name })}
