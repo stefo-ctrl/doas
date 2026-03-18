@@ -1,8 +1,11 @@
 'use client';
 
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef, Suspense } from 'react';
+import { useSearchParams, useRouter } from 'next/navigation';
+import { humanCategory } from '@/lib/unspsc';
 
-// Format currency — numeric sort-safe
+// ── Helpers ──────────────────────────────────────────────
+
 function fmtCurrency(v) {
   if (typeof v !== 'number' || isNaN(v)) return '$0';
   if (v >= 1e9) return '$' + (v / 1e9).toFixed(2) + 'B';
@@ -35,47 +38,85 @@ function computeStats(arr) {
 }
 
 const PAGE_SIZE = 50;
+const FETCH_TIMEOUT_MS = 45000; // 45 second client-side timeout
 
-export default function Home() {
-  const [from, setFrom] = useState(daysAgo(30));
-  const [to, setTo] = useState(isoDate(new Date()));
+// ── Main Component ───────────────────────────────────────
+
+export default function Page() {
+  return (
+    <Suspense fallback={<div className="py-20 text-center text-xs text-gray-400">Loading…</div>}>
+      <Home />
+    </Suspense>
+  );
+}
+
+function Home() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
+  // #6 — Initialize state from URL params, fall back to defaults
+  const [from, setFrom] = useState(() => searchParams.get('from') || daysAgo(30));
+  const [to, setTo] = useState(() => searchParams.get('to') || isoDate(new Date()));
   const [contracts, setContracts] = useState([]);
   const [meta, setMeta] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [loadingMsg, setLoadingMsg] = useState('');
   const [error, setError] = useState(null);
-  const [tab, setTab] = useState('table');
-  const [search, setSearch] = useState('');
-  const [agencyFilter, setAgencyFilter] = useState('');
+  const [tab, setTab] = useState(() => searchParams.get('tab') || 'table');
+  const [search, setSearch] = useState(() => searchParams.get('q') || '');
+  const [agencyFilter, setAgencyFilter] = useState(() => searchParams.get('agency') || '');
   const [sortCol, setSortCol] = useState('value');
   const [sortDir, setSortDir] = useState('desc');
   const [page, setPage] = useState(0);
   const [selectedId, setSelectedId] = useState(null);
   const [activeRange, setActiveRange] = useState(30);
+  const modalRef = useRef(null);
 
-  // Are any filters active?
   const isFiltered = search !== '' || agencyFilter !== '';
 
-  // Clear all filters
+  // #6 — Sync state to URL params
+  useEffect(() => {
+    const params = new URLSearchParams();
+    if (from) params.set('from', from);
+    if (to) params.set('to', to);
+    if (tab !== 'table') params.set('tab', tab);
+    if (search) params.set('q', search);
+    if (agencyFilter) params.set('agency', agencyFilter);
+    const str = params.toString();
+    const newUrl = str ? `?${str}` : '/';
+    router.replace(newUrl, { scroll: false });
+  }, [from, to, tab, search, agencyFilter, router]);
+
   function clearFilters() {
     setSearch('');
     setAgencyFilter('');
     setPage(0);
   }
 
-  // Fetch from our own API route
+  // #3 — Fetch with timeout and progress messaging
   const fetchContracts = useCallback(async (f, t) => {
     console.log('[DOAS] Fetching:', f, 'to', t);
     setLoading(true);
+    setLoadingMsg('Connecting to AusTender…');
     setError(null);
     setContracts([]);
     setMeta(null);
     setPage(0);
-    setSearch('');
-    setAgencyFilter('');
     setSelectedId(null);
+
+    const timer = setTimeout(() => {
+      setLoadingMsg('Still loading — AusTender can be slow for large date ranges…');
+    }, 5000);
+
+    const timeout = setTimeout(() => {
+      setLoading(false);
+      setError('Request timed out. AusTender may be slow — try a shorter date range (7d or 14d).');
+    }, FETCH_TIMEOUT_MS);
 
     try {
       const res = await fetch(`/api/contracts?from=${f}&to=${t}`);
+      clearTimeout(timeout);
+      clearTimeout(timer);
       const data = await res.json();
       console.log('[DOAS] Response:', res.status, 'contracts:', data.contracts?.length);
 
@@ -86,19 +127,24 @@ export default function Home() {
       setContracts(data.contracts || []);
       setMeta(data.meta || null);
     } catch (err) {
-      console.error('[DOAS] Fetch error:', err);
-      setError(err.message);
+      clearTimeout(timeout);
+      clearTimeout(timer);
+      if (err.name !== 'AbortError') {
+        console.error('[DOAS] Fetch error:', err);
+        setError(err.message);
+      }
     } finally {
+      clearTimeout(timeout);
+      clearTimeout(timer);
       setLoading(false);
+      setLoadingMsg('');
     }
   }, []);
 
-  // Fetch on mount
   useEffect(() => {
     fetchContracts(from, to);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Quick range
   function setRange(days) {
     const f = daysAgo(days);
     const t = isoDate(new Date());
@@ -108,13 +154,29 @@ export default function Home() {
     fetchContracts(f, t);
   }
 
-  // Sorting
   function doSort(col) {
     if (sortCol === col) setSortDir(d => d === 'desc' ? 'asc' : 'desc');
     else { setSortCol(col); setSortDir('desc'); }
   }
 
-  // Filtered (search + agency) — unsorted, used for stats & charts
+  // #12 — Close modal on Escape key
+  useEffect(() => {
+    function handleKey(e) {
+      if (e.key === 'Escape' && selectedId) setSelectedId(null);
+    }
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, [selectedId]);
+
+  // #12 — Trap focus in modal
+  useEffect(() => {
+    if (selected && modalRef.current) {
+      modalRef.current.focus();
+    }
+  });
+
+  // ── Derived data ──
+
   const filteredUnsorted = useMemo(() => {
     let arr = contracts;
     if (search) {
@@ -132,7 +194,6 @@ export default function Home() {
     return arr;
   }, [contracts, search, agencyFilter]);
 
-  // Filtered + sorted — used for table display
   const filtered = useMemo(() => {
     return [...filteredUnsorted].sort((a, b) => {
       let av, bv;
@@ -152,42 +213,54 @@ export default function Home() {
     });
   }, [filteredUnsorted, sortCol, sortDir]);
 
-  // Hero stats — derived from FILTERED data so they react to search/agency
   const heroStats = useMemo(() => computeStats(filteredUnsorted), [filteredUnsorted]);
-
-  // Total stats (unfiltered) — for "of X total" comparison
   const totalStats = useMemo(() => computeStats(contracts), [contracts]);
 
-  // Agencies for filter dropdown (always from full set)
   const agencies = useMemo(() =>
     [...new Set(contracts.map(c => c.agency).filter(Boolean))].sort(),
     [contracts]
   );
 
-  // --- All chart breakdowns derive from filteredUnsorted ---
+  // #10 — Top 5 biggest contracts for highlights
+  const highlights = useMemo(() =>
+    [...filteredUnsorted].sort((a, b) => b.value - a.value).slice(0, 5),
+    [filteredUnsorted]
+  );
 
-  // Agency breakdown for charts
+  // #9 — Supplier/agency context for modal
+  const supplierStats = useMemo(() => {
+    if (!selectedId) return null;
+    const sel = contracts.find(c => c.uid === selectedId);
+    if (!sel) return null;
+    const sameSupplier = contracts.filter(c => c.supplier === sel.supplier && c.uid !== sel.uid);
+    const sameAgency = contracts.filter(c => c.agency === sel.agency && c.uid !== sel.uid);
+    return {
+      supplierCount: sameSupplier.length,
+      supplierTotal: sameSupplier.reduce((s, c) => s + c.value, 0),
+      agencyCount: sameAgency.length,
+      agencyTotal: sameAgency.reduce((s, c) => s + c.value, 0),
+    };
+  }, [contracts, selectedId]);
+
+  // Chart breakdowns — all from filteredUnsorted
   const agencyBreakdown = useMemo(() => {
     const m = {};
     filteredUnsorted.forEach(c => { const a = c.agency || 'Unknown'; m[a] = (m[a] || 0) + c.value; });
     return Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, 10);
   }, [filteredUnsorted]);
 
-  // Method breakdown for charts
   const methodBreakdown = useMemo(() => {
     const m = {};
     filteredUnsorted.forEach(c => { const k = c.method || 'unknown'; if (!m[k]) m[k] = { n: 0, v: 0 }; m[k].n++; m[k].v += c.value; });
     return Object.entries(m).sort((a, b) => b[1].v - a[1].v);
   }, [filteredUnsorted]);
 
-  // Top suppliers for charts
   const supplierBreakdown = useMemo(() => {
     const m = {};
     filteredUnsorted.forEach(c => { const s = c.supplier || 'Unknown'; if (!m[s]) m[s] = { n: 0, v: 0 }; m[s].n++; m[s].v += c.value; });
     return Object.entries(m).sort((a, b) => b[1].v - a[1].v).slice(0, 10);
   }, [filteredUnsorted]);
 
-  // Value distribution
   const valueDist = useMemo(() => {
     const buckets = [
       { label: '$100M+', min: 1e8, n: 0, v: 0 },
@@ -203,11 +276,8 @@ export default function Home() {
     return buckets;
   }, [filteredUnsorted]);
 
-  // Pagination
   const totalPages = Math.ceil(filtered.length / PAGE_SIZE);
   const pageData = filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
-
-  // Selected contract for modal
   const selected = selectedId ? contracts.find(c => c.uid === selectedId) : null;
 
   const methodClass = (m) => {
@@ -217,32 +287,34 @@ export default function Home() {
   };
   const methodLabel = (m) => m === 'open' ? 'Open' : m === 'limited' ? 'Limited' : m === 'selective' ? 'Selective' : (m || '—');
 
+  // ── Render ──
+
   return (
     <>
       {/* TOP BAR */}
-      <div className="sticky top-0 z-50 bg-white border-b border-gray-200 px-7 py-2.5 flex items-center justify-between">
-        <div className="flex items-center gap-3.5">
+      <div className="sticky top-0 z-50 bg-white border-b border-gray-200 px-4 sm:px-7 py-2.5 flex items-center justify-between">
+        <div className="flex items-center gap-2 sm:gap-3.5">
           <span className="font-bold text-[17px] tracking-tight">
             DOAS<span className="inline-block w-[7px] h-[7px] bg-green-500 rounded-full ml-1.5 live-dot" />
           </span>
-          <span className="text-[10px] text-gray-400 uppercase tracking-[1.5px] font-medium">
+          <span className="text-[10px] text-gray-400 uppercase tracking-[1.5px] font-medium hidden sm:inline">
             Department of Australia&apos;s Spending
           </span>
         </div>
         <div className="flex gap-2.5">
           <a href="https://www.tenders.gov.au" target="_blank" rel="noopener noreferrer"
-            className="text-[10px] text-gray-400 border border-gray-200 rounded px-2 py-1 hover:text-gray-500 hover:border-gray-300 no-underline">
+            className="text-[10px] text-gray-400 border border-gray-200 rounded px-2 py-1 hover:text-gray-500 hover:border-gray-300 no-underline hidden sm:inline-block">
             source: tenders.gov.au
           </a>
           <a href="https://github.com/austender/austender-ocds-api" target="_blank" rel="noopener noreferrer"
-            className="text-[10px] text-gray-400 border border-gray-200 rounded px-2 py-1 hover:text-gray-500 hover:border-gray-300 no-underline">
+            className="text-[10px] text-gray-400 border border-gray-200 rounded px-2 py-1 hover:text-gray-500 hover:border-gray-300 no-underline hidden sm:inline-block">
             OCDS API
           </a>
         </div>
       </div>
 
       {/* CONTROLS */}
-      <div className="px-7 py-2.5 border-b border-gray-100 flex items-center gap-3 flex-wrap bg-gray-50/80">
+      <div className="px-4 sm:px-7 py-2.5 border-b border-gray-100 flex items-center gap-2 sm:gap-3 flex-wrap bg-gray-50/80">
         <label className="text-[10px] text-gray-400 uppercase tracking-wide font-medium">From</label>
         <input type="date" value={from} min="2022-01-01" onChange={e => setFrom(e.target.value)}
           className="text-xs px-2 py-1.5 border border-gray-200 rounded bg-white" />
@@ -263,79 +335,85 @@ export default function Home() {
         </div>
       </div>
 
-      {/* ACTIVE FILTER BANNER — only visible when filtering */}
+      {/* ACTIVE FILTER BANNER */}
       {isFiltered && !loading && (
-        <div className="px-7 py-2 bg-gray-900 text-white flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <span className="text-[10px] uppercase tracking-wide font-medium opacity-60">Showing</span>
-            {agencyFilter && (
-              <span className="text-[12px] font-semibold">{agencyFilter}</span>
-            )}
-            {search && (
-              <span className="text-[12px] font-semibold">
-                {agencyFilter ? ' matching ' : ''}&ldquo;{search}&rdquo;
-              </span>
-            )}
-            <span className="text-[11px] opacity-50">
-              — {filteredUnsorted.length.toLocaleString()} of {contracts.length.toLocaleString()} contracts
-            </span>
+        <div className="px-4 sm:px-7 py-2 bg-gray-900 text-white flex items-center justify-between">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="text-[10px] uppercase tracking-wide font-medium opacity-60 shrink-0">Showing</span>
+            {agencyFilter && <span className="text-[12px] font-semibold truncate">{agencyFilter}</span>}
+            {search && <span className="text-[12px] font-semibold truncate">{agencyFilter ? ' matching ' : ''}&ldquo;{search}&rdquo;</span>}
+            <span className="text-[11px] opacity-50 shrink-0">— {filteredUnsorted.length.toLocaleString()} of {contracts.length.toLocaleString()}</span>
           </div>
           <button onClick={clearFilters}
-            className="text-[10px] font-medium px-2.5 py-1 rounded border border-white/30 hover:bg-white/10 transition-colors">
+            className="text-[10px] font-medium px-2.5 py-1 rounded border border-white/30 hover:bg-white/10 transition-colors shrink-0">
             Clear filters
           </button>
         </div>
       )}
 
       {/* HERO STATS */}
-      <div className="grid grid-cols-4 border-b border-gray-200 max-md:grid-cols-2 max-sm:grid-cols-1">
-        <div className="px-7 py-5 border-r border-gray-200 max-sm:border-r-0">
+      <div className="grid grid-cols-2 sm:grid-cols-4 border-b border-gray-200">
+        <div className="px-4 sm:px-7 py-4 sm:py-5 border-r border-b sm:border-b-0 border-gray-200">
           <div className="text-[10px] text-gray-400 uppercase tracking-[1.4px] font-medium mb-0.5">Total Contract Value</div>
-          <div className="text-[26px] font-bold tracking-tight tabnum">{loading ? '…' : fmtCurrency(heroStats.total)}</div>
+          <div className="text-xl sm:text-[26px] font-bold tracking-tight tabnum">{loading ? '…' : fmtCurrency(heroStats.total)}</div>
           <div className="text-[11px] text-gray-400 mt-0.5">
-            {isFiltered && !loading
-              ? `of ${fmtCurrency(totalStats.total)} total`
-              : meta ? `${meta.from} → ${meta.to}` : ''}
+            {isFiltered && !loading ? `of ${fmtCurrency(totalStats.total)} total` : meta ? `${meta.from} → ${meta.to}` : ''}
           </div>
         </div>
-        <div className="px-7 py-5 border-r border-gray-200 max-sm:border-r-0">
-          <div className="text-[10px] text-gray-400 uppercase tracking-[1.4px] font-medium mb-0.5">Contracts Published</div>
-          <div className="text-[26px] font-bold tracking-tight tabnum">{loading ? '…' : heroStats.count.toLocaleString()}</div>
+        <div className="px-4 sm:px-7 py-4 sm:py-5 sm:border-r border-b sm:border-b-0 border-gray-200">
+          <div className="text-[10px] text-gray-400 uppercase tracking-[1.4px] font-medium mb-0.5">Contracts</div>
+          <div className="text-xl sm:text-[26px] font-bold tracking-tight tabnum">{loading ? '…' : heroStats.count.toLocaleString()}</div>
           <div className="text-[11px] text-gray-400 mt-0.5">
-            {isFiltered && !loading
-              ? `of ${totalStats.count.toLocaleString()} total`
-              : 'published in period'}
+            {isFiltered && !loading ? `of ${totalStats.count.toLocaleString()} total` : 'published in period'}
           </div>
         </div>
-        <div className="px-7 py-5 border-r border-gray-200 max-sm:border-r-0">
-          <div className="text-[10px] text-gray-400 uppercase tracking-[1.4px] font-medium mb-0.5">Unique Suppliers</div>
-          <div className="text-[26px] font-bold tracking-tight tabnum">{loading ? '…' : heroStats.suppliers.toLocaleString()}</div>
+        <div className="px-4 sm:px-7 py-4 sm:py-5 border-r border-gray-200">
+          <div className="text-[10px] text-gray-400 uppercase tracking-[1.4px] font-medium mb-0.5">Suppliers</div>
+          <div className="text-xl sm:text-[26px] font-bold tracking-tight tabnum">{loading ? '…' : heroStats.suppliers.toLocaleString()}</div>
           <div className="text-[11px] text-gray-400 mt-0.5">
-            {isFiltered && !loading
-              ? `of ${totalStats.suppliers.toLocaleString()} total`
-              : 'distinct entities'}
+            {isFiltered && !loading ? `of ${totalStats.suppliers.toLocaleString()} total` : 'distinct entities'}
           </div>
         </div>
-        <div className="px-7 py-5">
-          <div className="text-[10px] text-gray-400 uppercase tracking-[1.4px] font-medium mb-0.5">Limited Tender %</div>
-          <div className="text-[26px] font-bold tracking-tight tabnum">{loading ? '…' : heroStats.limitedPct.toFixed(1) + '%'}</div>
+        <div className="px-4 sm:px-7 py-4 sm:py-5">
+          <div className="text-[10px] text-gray-400 uppercase tracking-[1.4px] font-medium mb-0.5">Limited Tender</div>
+          <div className="text-xl sm:text-[26px] font-bold tracking-tight tabnum">{loading ? '…' : heroStats.limitedPct.toFixed(1) + '%'}</div>
           <div className="text-[11px] text-gray-400 mt-0.5">
             {heroStats.limitedCount.toLocaleString()} of {heroStats.count.toLocaleString()} no competitive bid
           </div>
         </div>
       </div>
 
+      {/* #10 — HIGHLIGHTS: Top 5 biggest contracts */}
+      {!loading && !error && highlights.length > 0 && !isFiltered && (
+        <div className="px-4 sm:px-7 py-4 border-b border-gray-200 bg-gray-50/50">
+          <div className="text-[10px] text-gray-400 uppercase tracking-[1.4px] font-semibold mb-2.5">Largest contracts this period</div>
+          <div className="flex gap-3 overflow-x-auto pb-1">
+            {highlights.map(c => (
+              <button key={c.uid} onClick={() => setSelectedId(c.uid)}
+                className="shrink-0 w-52 bg-white border border-gray-200 rounded-md p-3 text-left hover:border-gray-400 hover:shadow-sm transition-all">
+                <div className={`text-lg font-bold tabnum ${c.value >= 10000000 ? 'text-red-600' : ''}`}>{fmtCurrency(c.value)}</div>
+                <div className="text-[12px] font-semibold mt-1 truncate">{c.supplier || 'Not disclosed'}</div>
+                <div className="text-[11px] text-gray-400 truncate">{c.agency ? c.agency.replace(/^Department of /, '') : '—'}</div>
+                <span className={`mt-1.5 inline-block text-[9px] uppercase font-semibold tracking-wide px-1.5 py-0.5 rounded ${methodClass(c.method)}`}>
+                  {methodLabel(c.method)}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* STATUS */}
-      <div className="px-7 py-1.5 bg-gray-50/80 border-b border-gray-100 text-[11px] text-gray-400 flex items-center gap-1.5">
+      <div className="px-4 sm:px-7 py-1.5 bg-gray-50/80 border-b border-gray-100 text-[11px] text-gray-400 flex items-center gap-1.5">
         <span className={`inline-block w-1.5 h-1.5 rounded-full ${error ? 'bg-red-500' : loading ? 'bg-amber-400' : 'bg-green-500'}`} />
-        {error ? `Error: ${error}` : loading ? 'Fetching from AusTender…' : meta ? `Loaded ${meta.count.toLocaleString()} contracts from ${meta.source}` : 'Ready'}
+        {error ? `Error: ${error}` : loading ? (loadingMsg || 'Fetching from AusTender…') : meta ? `Loaded ${meta.count.toLocaleString()} contracts from ${meta.source}` : 'Ready'}
       </div>
 
       {/* TABS */}
-      <div className="flex border-b border-gray-200 px-7 bg-white">
+      <div className="flex border-b border-gray-200 px-4 sm:px-7 bg-white">
         {['table', 'charts'].map(t => (
           <button key={t} onClick={() => setTab(t)}
-            className={`px-5 py-2.5 text-xs font-semibold border-b-2 transition-all ${tab === t ? 'text-gray-900 border-gray-900' : 'text-gray-400 border-transparent hover:text-gray-600'}`}>
+            className={`px-4 sm:px-5 py-2.5 text-xs font-semibold border-b-2 transition-all ${tab === t ? 'text-gray-900 border-gray-900' : 'text-gray-400 border-transparent hover:text-gray-600'}`}>
             {t === 'table' ? 'Contracts' : 'Analytics'}
           </button>
         ))}
@@ -345,11 +423,11 @@ export default function Home() {
       {tab === 'table' && (
         <div>
           {/* Filter row */}
-          <div className="px-3 py-1.5 flex gap-2 items-center border-b border-gray-100 bg-gray-50/80">
+          <div className="px-3 py-1.5 flex gap-2 items-center border-b border-gray-100 bg-gray-50/80 flex-wrap">
             <input placeholder="Search supplier, agency, title…" value={search} onChange={e => { setSearch(e.target.value); setPage(0); }}
-              className="text-[11px] px-2 py-1 border border-gray-200 rounded bg-white w-56" />
+              className="text-[11px] px-2 py-1 border border-gray-200 rounded bg-white w-full sm:w-56" />
             <select value={agencyFilter} onChange={e => { setAgencyFilter(e.target.value); setPage(0); }}
-              className="text-[11px] px-2 py-1 border border-gray-200 rounded bg-white w-44">
+              className="text-[11px] px-2 py-1 border border-gray-200 rounded bg-white w-full sm:w-44">
               <option value="">All Agencies</option>
               {agencies.map(a => <option key={a} value={a}>{a.replace(/^Department of /, '')}</option>)}
             </select>
@@ -359,24 +437,64 @@ export default function Home() {
                 Clear
               </button>
             )}
-            <span className="ml-auto text-[11px] text-gray-400 tabnum">
+            <span className="ml-auto text-[11px] text-gray-400 tabnum shrink-0">
               {filtered.length.toLocaleString()} {isFiltered ? `of ${contracts.length.toLocaleString()} ` : ''}contracts
             </span>
           </div>
 
+          {/* #3 — Loading state with progress */}
           {loading ? (
             <div className="py-20 text-center">
               <div className="w-7 h-7 border-2 border-gray-200 border-t-gray-900 rounded-full spinner mx-auto mb-3" />
-              <div className="text-xs text-gray-400">Fetching contracts from AusTender…</div>
+              <div className="text-xs text-gray-400">{loadingMsg || 'Fetching contracts from AusTender…'}</div>
             </div>
           ) : error ? (
-            <div className="m-7 p-5 border border-red-400 rounded-md bg-red-50">
+            /* #3 — Error with retry */
+            <div className="m-4 sm:m-7 p-5 border border-red-400 rounded-md bg-red-50">
               <h3 className="text-red-600 text-sm font-semibold mb-1">Failed to fetch</h3>
-              <p className="text-[13px] text-gray-600">{error}</p>
+              <p className="text-[13px] text-gray-600 mb-3">{error}</p>
+              <div className="flex gap-2">
+                <button onClick={() => fetchContracts(from, to)}
+                  className="text-[11px] font-semibold px-3 py-1.5 bg-gray-900 text-white rounded hover:bg-gray-700">
+                  Retry
+                </button>
+                <button onClick={() => setRange(7)}
+                  className="text-[11px] font-medium px-3 py-1.5 border border-gray-300 rounded text-gray-600 hover:border-gray-400">
+                  Try last 7 days
+                </button>
+              </div>
+            </div>
+          ) : filtered.length === 0 ? (
+            /* #7 — Empty state */
+            <div className="py-16 text-center">
+              <div className="text-gray-300 text-4xl mb-3">&#8709;</div>
+              <div className="text-sm text-gray-500 mb-1">
+                {isFiltered
+                  ? `No contracts match your filters.`
+                  : `No contracts published between ${from} and ${to}.`}
+              </div>
+              <div className="text-xs text-gray-400 mb-4">
+                {isFiltered
+                  ? 'Try broadening your search or clearing filters.'
+                  : 'Try expanding your date range.'}
+              </div>
+              <div className="flex gap-2 justify-center">
+                {isFiltered && (
+                  <button onClick={clearFilters}
+                    className="text-[11px] font-medium px-3 py-1.5 border border-gray-300 rounded text-gray-600 hover:border-gray-400">
+                    Clear filters
+                  </button>
+                )}
+                <button onClick={() => setRange(30)}
+                  className="text-[11px] font-semibold px-3 py-1.5 bg-gray-900 text-white rounded hover:bg-gray-700">
+                  Try last 30 days
+                </button>
+              </div>
             </div>
           ) : (
             <>
-              <table className="w-full border-collapse text-[13px]">
+              {/* #5 — Desktop table, hidden on mobile */}
+              <table className="w-full border-collapse text-[13px] hidden sm:table">
                 <thead className="sticky top-[45px] z-10">
                   <tr>
                     {[
@@ -388,6 +506,7 @@ export default function Home() {
                       { key: 'date', label: 'Published' },
                     ].map(({ key, label }) => (
                       <th key={label} onClick={key ? () => doSort(key) : undefined}
+                        aria-sort={sortCol === key ? (sortDir === 'desc' ? 'descending' : 'ascending') : undefined}
                         className={`px-3 py-2 text-left text-[10px] uppercase tracking-wide font-semibold bg-gray-50 border-b border-gray-200 whitespace-nowrap ${key ? 'cursor-pointer hover:text-gray-900' : ''} ${sortCol === key ? 'text-gray-900' : 'text-gray-400'}`}>
                         {label} {sortCol === key ? (sortDir === 'desc' ? '↓' : '↑') : ''}
                       </th>
@@ -396,7 +515,13 @@ export default function Home() {
                 </thead>
                 <tbody>
                   {pageData.map(c => (
-                    <tr key={c.uid} onClick={() => setSelectedId(c.uid)} className="cursor-pointer hover:bg-gray-50 transition-colors">
+                    <tr key={c.uid}
+                      onClick={() => setSelectedId(c.uid)}
+                      onKeyDown={e => { if (e.key === 'Enter') setSelectedId(c.uid); }}
+                      tabIndex={0}
+                      role="button"
+                      aria-label={`${c.supplier || 'Unknown'} — ${fmtCurrency(c.value)}`}
+                      className="cursor-pointer hover:bg-gray-50 transition-colors focus:bg-blue-50 focus:outline-none">
                       <td className="px-3 py-2 border-b border-gray-50">
                         <span className={`font-semibold tabnum whitespace-nowrap ${c.value >= 10000000 ? 'text-red-600' : ''}`}>
                           {fmtCurrency(c.value)}
@@ -409,7 +534,7 @@ export default function Home() {
                       <td className="px-3 py-2 border-b border-gray-50 text-xs max-w-[200px]">
                         {c.agency ? c.agency.replace(/^Department of /, 'Dept. ') : '—'}
                       </td>
-                      <td className="px-3 py-2 border-b border-gray-50 text-[11px] text-gray-500 max-w-[160px]">{c.category || '—'}</td>
+                      <td className="px-3 py-2 border-b border-gray-50 text-[11px] text-gray-500 max-w-[160px]">{humanCategory(c.category) || '—'}</td>
                       <td className="px-3 py-2 border-b border-gray-50">
                         <span className={`text-[9px] uppercase font-semibold tracking-wide px-1.5 py-0.5 rounded ${methodClass(c.method)}`}>
                           {methodLabel(c.method)}
@@ -421,8 +546,33 @@ export default function Home() {
                 </tbody>
               </table>
 
+              {/* #5 — Mobile card layout */}
+              <div className="sm:hidden divide-y divide-gray-100">
+                {pageData.map(c => (
+                  <button key={c.uid} onClick={() => setSelectedId(c.uid)}
+                    className="w-full px-4 py-3 text-left hover:bg-gray-50 transition-colors">
+                    <div className="flex justify-between items-start">
+                      <div className="min-w-0 flex-1">
+                        <div className="font-semibold text-[13px] truncate">{c.supplier || 'Not disclosed'}</div>
+                        <div className="text-[11px] text-gray-400 truncate">{c.agency ? c.agency.replace(/^Department of /, '') : '—'}</div>
+                      </div>
+                      <div className="text-right ml-3 shrink-0">
+                        <div className={`font-bold tabnum ${c.value >= 10000000 ? 'text-red-600' : ''}`}>{fmtCurrency(c.value)}</div>
+                        <div className="text-[10px] text-gray-400 tabnum">{fmtDate(c.pubDate)}</div>
+                      </div>
+                    </div>
+                    <div className="flex gap-2 mt-1.5">
+                      <span className={`text-[9px] uppercase font-semibold tracking-wide px-1.5 py-0.5 rounded ${methodClass(c.method)}`}>
+                        {methodLabel(c.method)}
+                      </span>
+                      {c.category && <span className="text-[10px] text-gray-400 truncate">{humanCategory(c.category)}</span>}
+                    </div>
+                  </button>
+                ))}
+              </div>
+
               {totalPages > 1 && (
-                <div className="px-7 py-3 text-center text-[11px] text-gray-400 border-t border-gray-100 flex items-center justify-center gap-2">
+                <div className="px-4 sm:px-7 py-3 text-center text-[11px] text-gray-400 border-t border-gray-100 flex items-center justify-center gap-2">
                   {page > 0 && <button onClick={() => setPage(p => p - 1)} className="px-3 py-1 border border-gray-200 rounded bg-white text-gray-600 hover:border-gray-400">← Prev</button>}
                   <span>Page {page + 1} of {totalPages}</span>
                   {page < totalPages - 1 && <button onClick={() => setPage(p => p + 1)} className="px-3 py-1 border border-gray-200 rounded bg-white text-gray-600 hover:border-gray-400">Next →</button>}
@@ -435,8 +585,7 @@ export default function Home() {
 
       {/* ANALYTICS TAB */}
       {tab === 'charts' && (
-        <div className="p-7 grid grid-cols-2 gap-6 max-md:grid-cols-1">
-          {/* Show filter context in analytics too */}
+        <div className="p-4 sm:p-7 grid grid-cols-1 sm:grid-cols-2 gap-6">
           {isFiltered && (
             <div className="col-span-full text-[11px] text-gray-500 flex items-center gap-2 mb-1">
               <span>Analytics for {agencyFilter ? agencyFilter : 'filtered results'}{search ? ` matching "${search}"` : ''}</span>
@@ -462,16 +611,17 @@ export default function Home() {
         </div>
       )}
 
-      {/* MODAL */}
+      {/* #9 + #12 — MODAL with richer context, keyboard support, accessibility */}
       {selected && (
-        <div className="fixed inset-0 bg-black/40 z-[200] flex items-center justify-center" onClick={() => setSelectedId(null)}>
-          <div className="bg-white rounded-lg w-[520px] max-h-[80vh] overflow-y-auto shadow-2xl" onClick={e => e.stopPropagation()}>
-            <div className="px-6 py-5 border-b border-gray-100 flex justify-between items-start">
+        <div className="fixed inset-0 bg-black/40 z-[200] flex items-center justify-center p-4" onClick={() => setSelectedId(null)} role="dialog" aria-modal="true" aria-label="Contract details">
+          <div ref={modalRef} tabIndex={-1}
+            className="bg-white rounded-lg w-full max-w-[520px] max-h-[80vh] overflow-y-auto shadow-2xl focus:outline-none" onClick={e => e.stopPropagation()}>
+            <div className="px-5 sm:px-6 py-5 border-b border-gray-100 flex justify-between items-start">
               <div>
                 <div className="text-[11px] text-gray-400 mb-1">{selected.cnNumber || selected.ocid}</div>
                 <div className={`text-2xl font-bold tabnum ${selected.value >= 10000000 ? 'text-red-600' : ''}`}>{fmtCurrency(selected.value)}</div>
               </div>
-              <button onClick={() => setSelectedId(null)} className="w-7 h-7 border border-gray-200 rounded flex items-center justify-center text-gray-400 hover:text-gray-900 hover:border-gray-400">✕</button>
+              <button onClick={() => setSelectedId(null)} aria-label="Close" className="w-7 h-7 border border-gray-200 rounded flex items-center justify-center text-gray-400 hover:text-gray-900 hover:border-gray-400">✕</button>
             </div>
             <ModalSection title="Contract">
               <MRow label="Title" value={selected.title || '—'} />
@@ -479,23 +629,29 @@ export default function Home() {
               <MRow label="Start" value={fmtDate(selected.startDate)} />
               <MRow label="End" value={fmtDate(selected.endDate)} />
               <MRow label="Published" value={fmtDate(selected.pubDate)} />
+              <MRow label="Category" value={humanCategory(selected.category) || '—'} />
             </ModalSection>
             <ModalSection title="Supplier">
               <MRow label="Name" value={selected.supplier || 'Not disclosed'} />
               {selected.supplierABN && <MRow label="ABN" value={selected.supplierABN} />}
+              {supplierStats && supplierStats.supplierCount > 0 && (
+                <MRow label="Also in this period" value={`${supplierStats.supplierCount} other contracts (${fmtCurrency(supplierStats.supplierTotal)})`} />
+              )}
             </ModalSection>
             <ModalSection title="Procuring Agency">
               <MRow label="Agency" value={selected.agency || '—'} />
               {selected.division && <MRow label="Division" value={selected.division} />}
+              {supplierStats && supplierStats.agencyCount > 0 && (
+                <MRow label="Agency total this period" value={`${supplierStats.agencyCount + 1} contracts (${fmtCurrency(supplierStats.agencyTotal + selected.value)})`} />
+              )}
             </ModalSection>
             <ModalSection title="Procurement">
               <MRow label="Method" value={selected.method || '—'} />
               {selected.methodDetail && <MRow label="Detail" value={selected.methodDetail} />}
-              <MRow label="Category" value={selected.category || '—'} />
             </ModalSection>
-            <div className="px-6 py-4 border-t border-gray-100">
+            <div className="px-5 sm:px-6 py-4 border-t border-gray-100 flex items-center justify-between">
               <a href={selected.austenderUrl} target="_blank" rel="noopener noreferrer"
-                className="text-xs text-blue-600 hover:underline">
+                className="text-xs font-semibold text-blue-600 hover:underline">
                 View on AusTender →
               </a>
             </div>
@@ -504,7 +660,7 @@ export default function Home() {
       )}
 
       {/* FOOTER */}
-      <div className="px-7 py-5 border-t border-gray-200 text-[10px] text-gray-400 flex justify-between">
+      <div className="px-4 sm:px-7 py-5 border-t border-gray-200 text-[10px] text-gray-400 flex flex-col sm:flex-row justify-between gap-2">
         <div>
           DOAS — Department of Australia&apos;s Spending. Data from{' '}
           <a href="https://www.tenders.gov.au" target="_blank" rel="noopener noreferrer" className="text-gray-500 hover:underline">AusTender</a>{' '}
@@ -517,10 +673,11 @@ export default function Home() {
   );
 }
 
-// Reusable chart card
-function ChartCard({ title, data, format, maxVal, color, colorFn, isArray }) {
+// ── Subcomponents ──
+
+function ChartCard({ title, data, format, maxVal, color, colorFn }) {
   return (
-    <div className="bg-gray-50 border border-gray-100 rounded-md p-5">
+    <div className="bg-gray-50 border border-gray-100 rounded-md p-4 sm:p-5">
       <h3 className="text-[10px] uppercase tracking-[1.2px] text-gray-400 font-semibold mb-3">{title}</h3>
       {data.map((item, i) => {
         const d = format(item);
@@ -528,11 +685,11 @@ function ChartCard({ title, data, format, maxVal, color, colorFn, isArray }) {
         const bg = colorFn ? colorFn(item) : (color || '#111');
         return (
           <div key={i} className="flex items-center gap-1.5 mb-1" title={d.title || d.label}>
-            <span className="w-[130px] text-[11px] text-gray-500 whitespace-nowrap overflow-hidden text-ellipsis">{d.label}</span>
+            <span className="w-[100px] sm:w-[130px] text-[11px] text-gray-500 whitespace-nowrap overflow-hidden text-ellipsis">{d.label}</span>
             <div className="flex-1 h-3 bg-gray-200/60 rounded-sm overflow-hidden">
               <div className="h-full rounded-sm transition-all duration-300" style={{ width: `${pct}%`, background: bg }} />
             </div>
-            <span className="w-[75px] text-right text-[11px] font-semibold tabnum whitespace-nowrap">{d.display}</span>
+            <span className="w-[65px] sm:w-[75px] text-right text-[11px] font-semibold tabnum whitespace-nowrap">{d.display}</span>
           </div>
         );
       })}
@@ -542,7 +699,7 @@ function ChartCard({ title, data, format, maxVal, color, colorFn, isArray }) {
 
 function ModalSection({ title, children }) {
   return (
-    <div className="px-6 py-4 border-b border-gray-50">
+    <div className="px-5 sm:px-6 py-4 border-b border-gray-50">
       <h4 className="text-[10px] uppercase tracking-wide text-gray-400 font-semibold mb-2">{title}</h4>
       {children}
     </div>
@@ -551,9 +708,9 @@ function ModalSection({ title, children }) {
 
 function MRow({ label, value }) {
   return (
-    <div className="flex justify-between py-1 text-xs">
-      <span className="text-gray-500">{label}</span>
-      <span className="font-medium text-right max-w-[60%]">{value}</span>
+    <div className="flex justify-between py-1 text-xs gap-2">
+      <span className="text-gray-500 shrink-0">{label}</span>
+      <span className="font-medium text-right max-w-[65%] break-words">{value}</span>
     </div>
   );
 }
