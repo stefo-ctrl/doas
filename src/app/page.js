@@ -378,20 +378,35 @@ function Home() {
         </div>
       )}
 
+      {/* TRUNCATION NOTICE */}
+      {!loading && meta?.truncated && (
+        <div className="px-4 sm:px-7 py-1.5 bg-amber-50 border-b border-amber-200 text-[11px] text-amber-700 flex items-center gap-1.5">
+          <span>&#9888;</span>
+          <span>
+            Showing latest {meta.count.toLocaleString()} contracts ({meta.actualFrom} → {meta.actualTo}).
+            AusTender limits results — to see earlier data, adjust the end date.
+          </span>
+        </div>
+      )}
+
       {/* HERO STATS */}
       <div className="grid grid-cols-2 sm:grid-cols-4 border-b border-gray-200">
         <div className="px-4 sm:px-7 py-4 sm:py-5 border-r border-b sm:border-b-0 border-gray-200">
           <div className="text-[10px] text-gray-400 uppercase tracking-[1.4px] font-medium mb-0.5">Total Contract Value</div>
           <div className="text-xl sm:text-[26px] font-bold tracking-tight tabnum">{loading ? '…' : fmtCurrency(heroStats.total)}</div>
           <div className="text-[11px] text-gray-400 mt-0.5">
-            {isFiltered && !loading ? `of ${fmtCurrency(totalStats.total)} total` : !loading && from && to ? `${from} → ${to}` : ''}
+            {isFiltered && !loading
+              ? `of ${fmtCurrency(totalStats.total)} total`
+              : !loading && meta?.actualFrom
+                ? `${meta.actualFrom} → ${meta.actualTo}`
+                : !loading && from && to ? `${from} → ${to}` : ''}
           </div>
         </div>
         <div className="px-4 sm:px-7 py-4 sm:py-5 sm:border-r border-b sm:border-b-0 border-gray-200">
           <div className="text-[10px] text-gray-400 uppercase tracking-[1.4px] font-medium mb-0.5">Contracts</div>
           <div className="text-xl sm:text-[26px] font-bold tracking-tight tabnum">{loading ? '…' : heroStats.count.toLocaleString()}</div>
           <div className="text-[11px] text-gray-400 mt-0.5">
-            {isFiltered && !loading ? `of ${totalStats.count.toLocaleString()} total` : 'published in period'}
+            {isFiltered && !loading ? `of ${totalStats.count.toLocaleString()} total` : meta?.truncated ? 'latest from AusTender' : 'published in period'}
           </div>
         </div>
         <div className="px-4 sm:px-7 py-4 sm:py-5 border-r border-gray-200">
@@ -435,7 +450,7 @@ function Home() {
         <span className={`inline-block w-1.5 h-1.5 rounded-full ${error ? 'bg-red-500' : loading ? 'bg-amber-400' : 'bg-green-500'}`} />
         {error ? `Error: ${error}`
           : loading ? (loadingMsg || 'Fetching from AusTender…')
-          : meta ? `Loaded ${meta.count.toLocaleString()} contracts from ${meta.source}`
+          : meta ? `${meta.count.toLocaleString()} contracts (${meta.actualFrom || meta.from} → ${meta.actualTo || meta.to})${meta.truncated ? ' — results capped by AusTender' : ''}`
           : 'Ready'}
       </div>
 

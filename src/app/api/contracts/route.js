@@ -91,13 +91,22 @@ export async function GET(request) {
       url = (data.links || {}).next || null;
     }
 
+    // Compute the actual date range of returned data
+    const dates = contracts.map(c => (c.pubDate || '').slice(0, 10)).filter(Boolean).sort();
+    const actualFrom = dates[0] || from;
+    const actualTo = dates[dates.length - 1] || to;
+    const truncated = url !== null; // true if there were more pages we didn't fetch
+
     const result = {
       contracts,
       meta: {
         from,
         to,
+        actualFrom,
+        actualTo,
         count: contracts.length,
         pages,
+        truncated,
         fetchedAt: new Date().toISOString(),
         source: 'api.tenders.gov.au',
       },
