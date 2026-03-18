@@ -37,13 +37,6 @@ function computeStats(arr) {
   return { total, count: arr.length, suppliers: suppliers.size, limitedPct: pct, limitedCount: limited.length };
 }
 
-/** Check if a contract's pubDate falls within [from, to] inclusive */
-function inDateRange(c, from, to) {
-  const d = (c.pubDate || '').slice(0, 10); // YYYY-MM-DD
-  if (!d) return true; // include contracts with no date
-  return d >= from && d <= to;
-}
-
 const PAGE_SIZE = 50;
 const FETCH_TIMEOUT_MS = 45000;
 
@@ -62,10 +55,7 @@ function Home() {
   const searchParams = useSearchParams();
 
   // ── State ──
-  // allContracts = full 90-day dataset from the API (the "pool")
-  // from/to = the currently selected view range (filters client-side from the pool)
-  const [allContracts, setAllContracts] = useState([]);
-  const [poolRange, setPoolRange] = useState(null); // { from, to } of what's loaded
+  const [contracts, setContracts] = useState([]);
   const [meta, setMeta] = useState(null);
   const [loading, setLoading] = useState(false);
   const [loadingMsg, setLoadingMsg] = useState('');
@@ -82,6 +72,9 @@ function Home() {
   const [selectedId, setSelectedId] = useState(null);
   const [activeRange, setActiveRange] = useState(30);
   const modalRef = useRef(null);
+
+  // Client-side cache: key = "from|to", value = { contracts, meta }
+  const cacheRef = useRef(new Map());
 
   const isFiltered = search !== '' || agencyFilter !== '';
 
@@ -103,12 +96,27 @@ function Home() {
     setPage(0);
   }
 
-  // ── API fetch — loads data into the pool ──
-  const fetchFromAPI = useCallback(async (f, t) => {
+  // ── API fetch with client-side caching ──
+  const fetchContracts = useCallback(async (f, t) => {
+    // Check client-side cache first (instant if we've fetched this range before)
+    const cacheKey = `${f}|${t}`;
+    const cached = cacheRef.current.get(cacheKey);
+    if (cached) {
+      console.log('[DOAS] Cache hit:', f, 'to', t, '→', cached.contracts.length, 'contracts');
+      setContracts(cached.contracts);
+      setMeta(cached.meta);
+      setError(null);
+      setPage(0);
+      setSelectedId(null);
+      return;
+    }
+
     console.log('[DOAS] Fetching from API:', f, 'to', t);
     setLoading(true);
     setLoadingMsg('Connecting to AusTender…');
     setError(null);
+    setContracts([]);
+    setMeta(null);
     setPage(0);
     setSelectedId(null);
 
@@ -130,9 +138,13 @@ function Home() {
 
       if (!res.ok) throw new Error(data.error || `API returned ${res.status}`);
 
-      setAllContracts(data.contracts || []);
-      setPoolRange({ from: f, to: t });
-      setMeta(data.meta || null);
+      const result = { contracts: data.contracts || [], meta: data.meta || null };
+
+      // Store in client-side cache
+      cacheRef.current.set(cacheKey, result);
+
+      setContracts(result.contracts);
+      setMeta(result.meta);
     } catch (err) {
       clearTimeout(timeout);
       clearTimeout(timer);
@@ -148,39 +160,26 @@ function Home() {
     }
   }, []);
 
-  // On mount: fetch 90 days (the max pool). This is the one slow load.
+  // Fetch on mount with default range
   useEffect(() => {
-    fetchFromAPI(daysAgo(90), isoDate(new Date()));
+    fetchContracts(from, to);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Quick range buttons — just update the view window, no API call
+  // Range buttons — fetch from API (with client cache for instant re-visits)
   function setRange(days) {
     const f = daysAgo(days);
     const t = isoDate(new Date());
     setFrom(f);
     setTo(t);
     setActiveRange(days);
-    setPage(0);
     setSearch('');
     setAgencyFilter('');
-    setSelectedId(null);
-    // Only fetch if requested range exceeds what's in the pool
-    if (poolRange && f >= poolRange.from && t <= poolRange.to) {
-      // Data already loaded — instant, no API call
-      return;
-    }
-    fetchFromAPI(f, t);
+    fetchContracts(f, t);
   }
 
-  // Manual Fetch button — always calls API (for custom date ranges)
+  // Manual Fetch button
   function handleManualFetch() {
-    // If the requested range is within the pool, just update the view
-    if (poolRange && from >= poolRange.from && to <= poolRange.to) {
-      setPage(0);
-      setSelectedId(null);
-      return;
-    }
-    fetchFromAPI(from, to);
+    fetchContracts(from, to);
   }
 
   function doSort(col) {
@@ -198,12 +197,6 @@ function Home() {
   }, [selectedId]);
 
   // ── Derived data ──
-
-  // Step 1: Slice the pool by the selected date range (instant)
-  const contracts = useMemo(() => {
-    if (!from || !to) return allContracts;
-    return allContracts.filter(c => inDateRange(c, from, to));
-  }, [allContracts, from, to]);
 
   // Step 2: Apply search + agency filters
   const filteredUnsorted = useMemo(() => {
@@ -307,7 +300,7 @@ function Home() {
 
   const totalPages = Math.ceil(filtered.length / PAGE_SIZE);
   const pageData = filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
-  const selected = selectedId ? allContracts.find(c => c.uid === selectedId) : null;
+  const selected = selectedId ? contracts.find(c => c.uid === selectedId) : null;
 
   // Focus modal on open
   useEffect(() => {
@@ -320,9 +313,6 @@ function Home() {
     return 'bg-blue-50 text-blue-700';
   };
   const methodLabel = (m) => m === 'open' ? 'Open' : m === 'limited' ? 'Limited' : m === 'selective' ? 'Selective' : (m || '—');
-
-  // Is the current view range within the loaded pool? (i.e., no API call needed)
-  const isWithinPool = poolRange && from >= poolRange.from && to <= poolRange.to;
 
   // ── Render ──
 
@@ -360,7 +350,7 @@ function Home() {
           className="text-xs px-2 py-1.5 border border-gray-200 rounded bg-white" />
         <button onClick={handleManualFetch} disabled={loading}
           className="text-[11px] font-semibold px-3.5 py-1.5 bg-gray-900 text-white border border-gray-900 rounded hover:bg-gray-700 disabled:opacity-30">
-          {loading ? 'Fetching…' : isWithinPool ? 'Refresh' : 'Fetch'}
+          {loading ? 'Fetching…' : 'Fetch'}
         </button>
         <div className="flex gap-1 ml-auto">
           {[7, 14, 30, 90].map(d => (
@@ -445,7 +435,7 @@ function Home() {
         <span className={`inline-block w-1.5 h-1.5 rounded-full ${error ? 'bg-red-500' : loading ? 'bg-amber-400' : 'bg-green-500'}`} />
         {error ? `Error: ${error}`
           : loading ? (loadingMsg || 'Fetching from AusTender…')
-          : meta ? `${contracts.length.toLocaleString()} contracts in view (${allContracts.length.toLocaleString()} loaded from ${meta.source})`
+          : meta ? `Loaded ${meta.count.toLocaleString()} contracts from ${meta.source}`
           : 'Ready'}
       </div>
 
