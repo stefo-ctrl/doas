@@ -3,7 +3,7 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
 
 // Format currency — numeric sort-safe
-function $(v) {
+function fmtCurrency(v) {
   if (typeof v !== 'number' || isNaN(v)) return '$0';
   if (v >= 1e9) return '$' + (v / 1e9).toFixed(2) + 'B';
   if (v >= 1e6) return '$' + (v / 1e6).toFixed(1) + 'M';
@@ -46,6 +46,7 @@ export default function Home() {
 
   // Fetch from our own API route
   const fetchContracts = useCallback(async (f, t) => {
+    console.log('[DOAS] Fetching:', f, 'to', t);
     setLoading(true);
     setError(null);
     setContracts([]);
@@ -58,6 +59,7 @@ export default function Home() {
     try {
       const res = await fetch(`/api/contracts?from=${f}&to=${t}`);
       const data = await res.json();
+      console.log('[DOAS] Response:', res.status, 'contracts:', data.contracts?.length);
 
       if (!res.ok) {
         throw new Error(data.error || `API returned ${res.status}`);
@@ -66,6 +68,7 @@ export default function Home() {
       setContracts(data.contracts || []);
       setMeta(data.meta || null);
     } catch (err) {
+      console.error('[DOAS] Fetch error:', err);
       setError(err.message);
     } finally {
       setLoading(false);
@@ -243,7 +246,7 @@ export default function Home() {
       <div className="grid grid-cols-4 border-b border-gray-200 max-md:grid-cols-2 max-sm:grid-cols-1">
         <div className="px-7 py-5 border-r border-gray-200 max-sm:border-r-0">
           <div className="text-[10px] text-gray-400 uppercase tracking-[1.4px] font-medium mb-0.5">Total Contract Value</div>
-          <div className="text-[26px] font-bold tracking-tight tabnum">{loading ? '…' : $(heroStats.total)}</div>
+          <div className="text-[26px] font-bold tracking-tight tabnum">{loading ? '…' : fmtCurrency(heroStats.total)}</div>
           <div className="text-[11px] text-gray-400 mt-0.5">{meta ? `${meta.from} → ${meta.to}` : ''}</div>
         </div>
         <div className="px-7 py-5 border-r border-gray-200 max-sm:border-r-0">
@@ -329,7 +332,7 @@ export default function Home() {
                     <tr key={c.uid} onClick={() => setSelectedId(c.uid)} className="cursor-pointer hover:bg-gray-50 transition-colors">
                       <td className="px-3 py-2 border-b border-gray-50">
                         <span className={`font-semibold tabnum whitespace-nowrap ${c.value >= 10000000 ? 'text-red-600' : ''}`}>
-                          {$(c.value)}
+                          {fmtCurrency(c.value)}
                         </span>
                       </td>
                       <td className="px-3 py-2 border-b border-gray-50 max-w-[200px]">
@@ -367,7 +370,7 @@ export default function Home() {
       {tab === 'charts' && (
         <div className="p-7 grid grid-cols-2 gap-6 max-md:grid-cols-1">
           <ChartCard title="Top Agencies by Value" data={agencyBreakdown}
-            format={([name, val]) => ({ label: name.replace(/^Department of /, '').replace(/^Australian /, ''), value: val, display: $(val) })}
+            format={([name, val]) => ({ label: name.replace(/^Department of /, '').replace(/^Australian /, ''), value: val, display: fmtCurrency(val) })}
             maxVal={agencyBreakdown[0]?.[1] || 1} color="#111" />
           <ChartCard title="Procurement Method" data={methodBreakdown}
             format={([m, d]) => ({
@@ -377,10 +380,10 @@ export default function Home() {
             maxVal={contracts.length || 1}
             colorFn={([m]) => m === 'limited' ? '#d97706' : m === 'open' ? '#16a34a' : '#2563eb'} />
           <ChartCard title="Top Suppliers by Value" data={supplierBreakdown}
-            format={([name, d]) => ({ label: name.length > 24 ? name.slice(0, 24) + '…' : name, value: d.v, display: $(d.v), title: name })}
+            format={([name, d]) => ({ label: name.length > 24 ? name.slice(0, 24) + '…' : name, value: d.v, display: fmtCurrency(d.v), title: name })}
             maxVal={supplierBreakdown[0]?.[1]?.v || 1} color="#111" />
           <ChartCard title="Contract Value Distribution" data={valueDist}
-            format={(b) => ({ label: b.label, value: b.n, display: `${b.n.toLocaleString()} / ${$(b.v)}` })}
+            format={(b) => ({ label: b.label, value: b.n, display: `${b.n.toLocaleString()} / ${fmtCurrency(b.v)}` })}
             maxVal={Math.max(...valueDist.map(b => b.n), 1)} color="#111" isArray />
         </div>
       )}
@@ -392,7 +395,7 @@ export default function Home() {
             <div className="px-6 py-5 border-b border-gray-100 flex justify-between items-start">
               <div>
                 <div className="text-[11px] text-gray-400 mb-1">{selected.cnNumber || selected.ocid}</div>
-                <div className={`text-2xl font-bold tabnum ${selected.value >= 10000000 ? 'text-red-600' : ''}`}>{$(selected.value)}</div>
+                <div className={`text-2xl font-bold tabnum ${selected.value >= 10000000 ? 'text-red-600' : ''}`}>{fmtCurrency(selected.value)}</div>
               </div>
               <button onClick={() => setSelectedId(null)} className="w-7 h-7 border border-gray-200 rounded flex items-center justify-center text-gray-400 hover:text-gray-900 hover:border-gray-400">✕</button>
             </div>
