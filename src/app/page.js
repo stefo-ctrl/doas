@@ -37,8 +37,15 @@ function computeStats(arr) {
   return { total, count: arr.length, suppliers: suppliers.size, limitedPct: pct, limitedCount: limited.length };
 }
 
+/** Check if a contract's pubDate falls within [from, to] inclusive */
+function inDateRange(c, from, to) {
+  const d = (c.pubDate || '').slice(0, 10); // YYYY-MM-DD
+  if (!d) return true; // include contracts with no date
+  return d >= from && d <= to;
+}
+
 const PAGE_SIZE = 50;
-const FETCH_TIMEOUT_MS = 45000; // 45 second client-side timeout
+const FETCH_TIMEOUT_MS = 45000;
 
 // ── Main Component ───────────────────────────────────────
 
@@ -54,14 +61,18 @@ function Home() {
   const router = useRouter();
   const searchParams = useSearchParams();
 
-  // #6 — Initialize state from URL params, fall back to defaults
-  const [from, setFrom] = useState(() => searchParams.get('from') || daysAgo(30));
-  const [to, setTo] = useState(() => searchParams.get('to') || isoDate(new Date()));
-  const [contracts, setContracts] = useState([]);
+  // ── State ──
+  // allContracts = full 90-day dataset from the API (the "pool")
+  // from/to = the currently selected view range (filters client-side from the pool)
+  const [allContracts, setAllContracts] = useState([]);
+  const [poolRange, setPoolRange] = useState(null); // { from, to } of what's loaded
   const [meta, setMeta] = useState(null);
   const [loading, setLoading] = useState(false);
   const [loadingMsg, setLoadingMsg] = useState('');
   const [error, setError] = useState(null);
+
+  const [from, setFrom] = useState(() => searchParams.get('from') || daysAgo(30));
+  const [to, setTo] = useState(() => searchParams.get('to') || isoDate(new Date()));
   const [tab, setTab] = useState(() => searchParams.get('tab') || 'table');
   const [search, setSearch] = useState(() => searchParams.get('q') || '');
   const [agencyFilter, setAgencyFilter] = useState(() => searchParams.get('agency') || '');
@@ -74,7 +85,7 @@ function Home() {
 
   const isFiltered = search !== '' || agencyFilter !== '';
 
-  // #6 — Sync state to URL params
+  // ── URL sync ──
   useEffect(() => {
     const params = new URLSearchParams();
     if (from) params.set('from', from);
@@ -83,8 +94,7 @@ function Home() {
     if (search) params.set('q', search);
     if (agencyFilter) params.set('agency', agencyFilter);
     const str = params.toString();
-    const newUrl = str ? `?${str}` : '/';
-    router.replace(newUrl, { scroll: false });
+    router.replace(str ? `?${str}` : '/', { scroll: false });
   }, [from, to, tab, search, agencyFilter, router]);
 
   function clearFilters() {
@@ -93,14 +103,12 @@ function Home() {
     setPage(0);
   }
 
-  // #3 — Fetch with timeout and progress messaging
-  const fetchContracts = useCallback(async (f, t) => {
-    console.log('[DOAS] Fetching:', f, 'to', t);
+  // ── API fetch — loads data into the pool ──
+  const fetchFromAPI = useCallback(async (f, t) => {
+    console.log('[DOAS] Fetching from API:', f, 'to', t);
     setLoading(true);
     setLoadingMsg('Connecting to AusTender…');
     setError(null);
-    setContracts([]);
-    setMeta(null);
     setPage(0);
     setSelectedId(null);
 
@@ -110,7 +118,7 @@ function Home() {
 
     const timeout = setTimeout(() => {
       setLoading(false);
-      setError('Request timed out. AusTender may be slow — try a shorter date range (7d or 14d).');
+      setError('Request timed out. AusTender may be slow — try a shorter date range.');
     }, FETCH_TIMEOUT_MS);
 
     try {
@@ -120,11 +128,10 @@ function Home() {
       const data = await res.json();
       console.log('[DOAS] Response:', res.status, 'contracts:', data.contracts?.length);
 
-      if (!res.ok) {
-        throw new Error(data.error || `API returned ${res.status}`);
-      }
+      if (!res.ok) throw new Error(data.error || `API returned ${res.status}`);
 
-      setContracts(data.contracts || []);
+      setAllContracts(data.contracts || []);
+      setPoolRange({ from: f, to: t });
       setMeta(data.meta || null);
     } catch (err) {
       clearTimeout(timeout);
@@ -141,17 +148,39 @@ function Home() {
     }
   }, []);
 
+  // On mount: fetch 90 days (the max pool). This is the one slow load.
   useEffect(() => {
-    fetchContracts(from, to);
+    fetchFromAPI(daysAgo(90), isoDate(new Date()));
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Quick range buttons — just update the view window, no API call
   function setRange(days) {
     const f = daysAgo(days);
     const t = isoDate(new Date());
     setFrom(f);
     setTo(t);
     setActiveRange(days);
-    fetchContracts(f, t);
+    setPage(0);
+    setSearch('');
+    setAgencyFilter('');
+    setSelectedId(null);
+    // Only fetch if requested range exceeds what's in the pool
+    if (poolRange && f >= poolRange.from && t <= poolRange.to) {
+      // Data already loaded — instant, no API call
+      return;
+    }
+    fetchFromAPI(f, t);
+  }
+
+  // Manual Fetch button — always calls API (for custom date ranges)
+  function handleManualFetch() {
+    // If the requested range is within the pool, just update the view
+    if (poolRange && from >= poolRange.from && to <= poolRange.to) {
+      setPage(0);
+      setSelectedId(null);
+      return;
+    }
+    fetchFromAPI(from, to);
   }
 
   function doSort(col) {
@@ -159,7 +188,7 @@ function Home() {
     else { setSortCol(col); setSortDir('desc'); }
   }
 
-  // #12 — Close modal on Escape key
+  // Escape closes modal
   useEffect(() => {
     function handleKey(e) {
       if (e.key === 'Escape' && selectedId) setSelectedId(null);
@@ -168,15 +197,15 @@ function Home() {
     return () => window.removeEventListener('keydown', handleKey);
   }, [selectedId]);
 
-  // #12 — Trap focus in modal
-  useEffect(() => {
-    if (selected && modalRef.current) {
-      modalRef.current.focus();
-    }
-  });
-
   // ── Derived data ──
 
+  // Step 1: Slice the pool by the selected date range (instant)
+  const contracts = useMemo(() => {
+    if (!from || !to) return allContracts;
+    return allContracts.filter(c => inDateRange(c, from, to));
+  }, [allContracts, from, to]);
+
+  // Step 2: Apply search + agency filters
   const filteredUnsorted = useMemo(() => {
     let arr = contracts;
     if (search) {
@@ -194,6 +223,7 @@ function Home() {
     return arr;
   }, [contracts, search, agencyFilter]);
 
+  // Step 3: Sort for table display
   const filtered = useMemo(() => {
     return [...filteredUnsorted].sort((a, b) => {
       let av, bv;
@@ -213,6 +243,7 @@ function Home() {
     });
   }, [filteredUnsorted, sortCol, sortDir]);
 
+  // Stats: from filtered view (reacts to dates + search + agency instantly)
   const heroStats = useMemo(() => computeStats(filteredUnsorted), [filteredUnsorted]);
   const totalStats = useMemo(() => computeStats(contracts), [contracts]);
 
@@ -221,13 +252,11 @@ function Home() {
     [contracts]
   );
 
-  // #10 — Top 5 biggest contracts for highlights
   const highlights = useMemo(() =>
     [...filteredUnsorted].sort((a, b) => b.value - a.value).slice(0, 5),
     [filteredUnsorted]
   );
 
-  // #9 — Supplier/agency context for modal
   const supplierStats = useMemo(() => {
     if (!selectedId) return null;
     const sel = contracts.find(c => c.uid === selectedId);
@@ -242,7 +271,7 @@ function Home() {
     };
   }, [contracts, selectedId]);
 
-  // Chart breakdowns — all from filteredUnsorted
+  // Chart breakdowns
   const agencyBreakdown = useMemo(() => {
     const m = {};
     filteredUnsorted.forEach(c => { const a = c.agency || 'Unknown'; m[a] = (m[a] || 0) + c.value; });
@@ -278,7 +307,12 @@ function Home() {
 
   const totalPages = Math.ceil(filtered.length / PAGE_SIZE);
   const pageData = filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
-  const selected = selectedId ? contracts.find(c => c.uid === selectedId) : null;
+  const selected = selectedId ? allContracts.find(c => c.uid === selectedId) : null;
+
+  // Focus modal on open
+  useEffect(() => {
+    if (selected && modalRef.current) modalRef.current.focus();
+  });
 
   const methodClass = (m) => {
     if (m === 'open') return 'bg-green-50 text-green-700';
@@ -286,6 +320,9 @@ function Home() {
     return 'bg-blue-50 text-blue-700';
   };
   const methodLabel = (m) => m === 'open' ? 'Open' : m === 'limited' ? 'Limited' : m === 'selective' ? 'Selective' : (m || '—');
+
+  // Is the current view range within the loaded pool? (i.e., no API call needed)
+  const isWithinPool = poolRange && from >= poolRange.from && to <= poolRange.to;
 
   // ── Render ──
 
@@ -316,14 +353,14 @@ function Home() {
       {/* CONTROLS */}
       <div className="px-4 sm:px-7 py-2.5 border-b border-gray-100 flex items-center gap-2 sm:gap-3 flex-wrap bg-gray-50/80">
         <label className="text-[10px] text-gray-400 uppercase tracking-wide font-medium">From</label>
-        <input type="date" value={from} min="2022-01-01" onChange={e => setFrom(e.target.value)}
+        <input type="date" value={from} min="2022-01-01" onChange={e => { setFrom(e.target.value); setPage(0); }}
           className="text-xs px-2 py-1.5 border border-gray-200 rounded bg-white" />
         <label className="text-[10px] text-gray-400 uppercase tracking-wide font-medium">To</label>
-        <input type="date" value={to} min="2022-01-01" onChange={e => setTo(e.target.value)}
+        <input type="date" value={to} min="2022-01-01" onChange={e => { setTo(e.target.value); setPage(0); }}
           className="text-xs px-2 py-1.5 border border-gray-200 rounded bg-white" />
-        <button onClick={() => fetchContracts(from, to)} disabled={loading}
+        <button onClick={handleManualFetch} disabled={loading}
           className="text-[11px] font-semibold px-3.5 py-1.5 bg-gray-900 text-white border border-gray-900 rounded hover:bg-gray-700 disabled:opacity-30">
-          {loading ? 'Fetching…' : 'Fetch'}
+          {loading ? 'Fetching…' : isWithinPool ? 'Refresh' : 'Fetch'}
         </button>
         <div className="flex gap-1 ml-auto">
           {[7, 14, 30, 90].map(d => (
@@ -357,7 +394,7 @@ function Home() {
           <div className="text-[10px] text-gray-400 uppercase tracking-[1.4px] font-medium mb-0.5">Total Contract Value</div>
           <div className="text-xl sm:text-[26px] font-bold tracking-tight tabnum">{loading ? '…' : fmtCurrency(heroStats.total)}</div>
           <div className="text-[11px] text-gray-400 mt-0.5">
-            {isFiltered && !loading ? `of ${fmtCurrency(totalStats.total)} total` : meta ? `${meta.from} → ${meta.to}` : ''}
+            {isFiltered && !loading ? `of ${fmtCurrency(totalStats.total)} total` : !loading && from && to ? `${from} → ${to}` : ''}
           </div>
         </div>
         <div className="px-4 sm:px-7 py-4 sm:py-5 sm:border-r border-b sm:border-b-0 border-gray-200">
@@ -383,7 +420,7 @@ function Home() {
         </div>
       </div>
 
-      {/* #10 — HIGHLIGHTS: Top 5 biggest contracts */}
+      {/* HIGHLIGHTS */}
       {!loading && !error && highlights.length > 0 && !isFiltered && (
         <div className="px-4 sm:px-7 py-4 border-b border-gray-200 bg-gray-50/50">
           <div className="text-[10px] text-gray-400 uppercase tracking-[1.4px] font-semibold mb-2.5">Largest contracts this period</div>
@@ -406,7 +443,10 @@ function Home() {
       {/* STATUS */}
       <div className="px-4 sm:px-7 py-1.5 bg-gray-50/80 border-b border-gray-100 text-[11px] text-gray-400 flex items-center gap-1.5">
         <span className={`inline-block w-1.5 h-1.5 rounded-full ${error ? 'bg-red-500' : loading ? 'bg-amber-400' : 'bg-green-500'}`} />
-        {error ? `Error: ${error}` : loading ? (loadingMsg || 'Fetching from AusTender…') : meta ? `Loaded ${meta.count.toLocaleString()} contracts from ${meta.source}` : 'Ready'}
+        {error ? `Error: ${error}`
+          : loading ? (loadingMsg || 'Fetching from AusTender…')
+          : meta ? `${contracts.length.toLocaleString()} contracts in view (${allContracts.length.toLocaleString()} loaded from ${meta.source})`
+          : 'Ready'}
       </div>
 
       {/* TABS */}
@@ -422,7 +462,6 @@ function Home() {
       {/* CONTRACTS TABLE TAB */}
       {tab === 'table' && (
         <div>
-          {/* Filter row */}
           <div className="px-3 py-1.5 flex gap-2 items-center border-b border-gray-100 bg-gray-50/80 flex-wrap">
             <input placeholder="Search supplier, agency, title…" value={search} onChange={e => { setSearch(e.target.value); setPage(0); }}
               className="text-[11px] px-2 py-1 border border-gray-200 rounded bg-white w-full sm:w-56" />
@@ -442,58 +481,41 @@ function Home() {
             </span>
           </div>
 
-          {/* #3 — Loading state with progress */}
           {loading ? (
             <div className="py-20 text-center">
               <div className="w-7 h-7 border-2 border-gray-200 border-t-gray-900 rounded-full spinner mx-auto mb-3" />
               <div className="text-xs text-gray-400">{loadingMsg || 'Fetching contracts from AusTender…'}</div>
             </div>
           ) : error ? (
-            /* #3 — Error with retry */
             <div className="m-4 sm:m-7 p-5 border border-red-400 rounded-md bg-red-50">
               <h3 className="text-red-600 text-sm font-semibold mb-1">Failed to fetch</h3>
               <p className="text-[13px] text-gray-600 mb-3">{error}</p>
               <div className="flex gap-2">
-                <button onClick={() => fetchContracts(from, to)}
-                  className="text-[11px] font-semibold px-3 py-1.5 bg-gray-900 text-white rounded hover:bg-gray-700">
-                  Retry
-                </button>
+                <button onClick={() => fetchFromAPI(from, to)}
+                  className="text-[11px] font-semibold px-3 py-1.5 bg-gray-900 text-white rounded hover:bg-gray-700">Retry</button>
                 <button onClick={() => setRange(7)}
-                  className="text-[11px] font-medium px-3 py-1.5 border border-gray-300 rounded text-gray-600 hover:border-gray-400">
-                  Try last 7 days
-                </button>
+                  className="text-[11px] font-medium px-3 py-1.5 border border-gray-300 rounded text-gray-600 hover:border-gray-400">Try last 7 days</button>
               </div>
             </div>
           ) : filtered.length === 0 ? (
-            /* #7 — Empty state */
             <div className="py-16 text-center">
               <div className="text-gray-300 text-4xl mb-3">&#8709;</div>
               <div className="text-sm text-gray-500 mb-1">
-                {isFiltered
-                  ? `No contracts match your filters.`
-                  : `No contracts published between ${from} and ${to}.`}
+                {isFiltered ? 'No contracts match your filters.' : `No contracts published between ${from} and ${to}.`}
               </div>
               <div className="text-xs text-gray-400 mb-4">
-                {isFiltered
-                  ? 'Try broadening your search or clearing filters.'
-                  : 'Try expanding your date range.'}
+                {isFiltered ? 'Try broadening your search or clearing filters.' : 'Try expanding your date range.'}
               </div>
               <div className="flex gap-2 justify-center">
                 {isFiltered && (
-                  <button onClick={clearFilters}
-                    className="text-[11px] font-medium px-3 py-1.5 border border-gray-300 rounded text-gray-600 hover:border-gray-400">
-                    Clear filters
-                  </button>
+                  <button onClick={clearFilters} className="text-[11px] font-medium px-3 py-1.5 border border-gray-300 rounded text-gray-600 hover:border-gray-400">Clear filters</button>
                 )}
-                <button onClick={() => setRange(30)}
-                  className="text-[11px] font-semibold px-3 py-1.5 bg-gray-900 text-white rounded hover:bg-gray-700">
-                  Try last 30 days
-                </button>
+                <button onClick={() => setRange(30)} className="text-[11px] font-semibold px-3 py-1.5 bg-gray-900 text-white rounded hover:bg-gray-700">Try last 30 days</button>
               </div>
             </div>
           ) : (
             <>
-              {/* #5 — Desktop table, hidden on mobile */}
+              {/* Desktop table */}
               <table className="w-full border-collapse text-[13px] hidden sm:table">
                 <thead className="sticky top-[45px] z-10">
                   <tr>
@@ -515,30 +537,18 @@ function Home() {
                 </thead>
                 <tbody>
                   {pageData.map(c => (
-                    <tr key={c.uid}
-                      onClick={() => setSelectedId(c.uid)}
-                      onKeyDown={e => { if (e.key === 'Enter') setSelectedId(c.uid); }}
-                      tabIndex={0}
-                      role="button"
-                      aria-label={`${c.supplier || 'Unknown'} — ${fmtCurrency(c.value)}`}
+                    <tr key={c.uid} onClick={() => setSelectedId(c.uid)} onKeyDown={e => { if (e.key === 'Enter') setSelectedId(c.uid); }}
+                      tabIndex={0} role="button" aria-label={`${c.supplier || 'Unknown'} — ${fmtCurrency(c.value)}`}
                       className="cursor-pointer hover:bg-gray-50 transition-colors focus:bg-blue-50 focus:outline-none">
-                      <td className="px-3 py-2 border-b border-gray-50">
-                        <span className={`font-semibold tabnum whitespace-nowrap ${c.value >= 10000000 ? 'text-red-600' : ''}`}>
-                          {fmtCurrency(c.value)}
-                        </span>
-                      </td>
+                      <td className="px-3 py-2 border-b border-gray-50"><span className={`font-semibold tabnum whitespace-nowrap ${c.value >= 10000000 ? 'text-red-600' : ''}`}>{fmtCurrency(c.value)}</span></td>
                       <td className="px-3 py-2 border-b border-gray-50 max-w-[200px]">
                         <div className="font-semibold text-[13px]">{c.supplier || 'Not disclosed'}</div>
                         {c.supplierABN && <div className="text-[10px] text-gray-400 mt-px">ABN {c.supplierABN}</div>}
                       </td>
-                      <td className="px-3 py-2 border-b border-gray-50 text-xs max-w-[200px]">
-                        {c.agency ? c.agency.replace(/^Department of /, 'Dept. ') : '—'}
-                      </td>
+                      <td className="px-3 py-2 border-b border-gray-50 text-xs max-w-[200px]">{c.agency ? c.agency.replace(/^Department of /, 'Dept. ') : '—'}</td>
                       <td className="px-3 py-2 border-b border-gray-50 text-[11px] text-gray-500 max-w-[160px]">{humanCategory(c.category) || '—'}</td>
                       <td className="px-3 py-2 border-b border-gray-50">
-                        <span className={`text-[9px] uppercase font-semibold tracking-wide px-1.5 py-0.5 rounded ${methodClass(c.method)}`}>
-                          {methodLabel(c.method)}
-                        </span>
+                        <span className={`text-[9px] uppercase font-semibold tracking-wide px-1.5 py-0.5 rounded ${methodClass(c.method)}`}>{methodLabel(c.method)}</span>
                       </td>
                       <td className="px-3 py-2 border-b border-gray-50 text-[11px] text-gray-500 whitespace-nowrap tabnum">{fmtDate(c.pubDate)}</td>
                     </tr>
@@ -546,11 +556,10 @@ function Home() {
                 </tbody>
               </table>
 
-              {/* #5 — Mobile card layout */}
+              {/* Mobile cards */}
               <div className="sm:hidden divide-y divide-gray-100">
                 {pageData.map(c => (
-                  <button key={c.uid} onClick={() => setSelectedId(c.uid)}
-                    className="w-full px-4 py-3 text-left hover:bg-gray-50 transition-colors">
+                  <button key={c.uid} onClick={() => setSelectedId(c.uid)} className="w-full px-4 py-3 text-left hover:bg-gray-50 transition-colors">
                     <div className="flex justify-between items-start">
                       <div className="min-w-0 flex-1">
                         <div className="font-semibold text-[13px] truncate">{c.supplier || 'Not disclosed'}</div>
@@ -562,9 +571,7 @@ function Home() {
                       </div>
                     </div>
                     <div className="flex gap-2 mt-1.5">
-                      <span className={`text-[9px] uppercase font-semibold tracking-wide px-1.5 py-0.5 rounded ${methodClass(c.method)}`}>
-                        {methodLabel(c.method)}
-                      </span>
+                      <span className={`text-[9px] uppercase font-semibold tracking-wide px-1.5 py-0.5 rounded ${methodClass(c.method)}`}>{methodLabel(c.method)}</span>
                       {c.category && <span className="text-[10px] text-gray-400 truncate">{humanCategory(c.category)}</span>}
                     </div>
                   </button>
@@ -607,15 +614,14 @@ function Home() {
             maxVal={supplierBreakdown[0]?.[1]?.v || 1} color="#111" />
           <ChartCard title="Contract Value Distribution" data={valueDist}
             format={(b) => ({ label: b.label, value: b.n, display: `${b.n.toLocaleString()} / ${fmtCurrency(b.v)}` })}
-            maxVal={Math.max(...valueDist.map(b => b.n), 1)} color="#111" isArray />
+            maxVal={Math.max(...valueDist.map(b => b.n), 1)} color="#111" />
         </div>
       )}
 
-      {/* #9 + #12 — MODAL with richer context, keyboard support, accessibility */}
+      {/* MODAL */}
       {selected && (
         <div className="fixed inset-0 bg-black/40 z-[200] flex items-center justify-center p-4" onClick={() => setSelectedId(null)} role="dialog" aria-modal="true" aria-label="Contract details">
-          <div ref={modalRef} tabIndex={-1}
-            className="bg-white rounded-lg w-full max-w-[520px] max-h-[80vh] overflow-y-auto shadow-2xl focus:outline-none" onClick={e => e.stopPropagation()}>
+          <div ref={modalRef} tabIndex={-1} className="bg-white rounded-lg w-full max-w-[520px] max-h-[80vh] overflow-y-auto shadow-2xl focus:outline-none" onClick={e => e.stopPropagation()}>
             <div className="px-5 sm:px-6 py-5 border-b border-gray-100 flex justify-between items-start">
               <div>
                 <div className="text-[11px] text-gray-400 mb-1">{selected.cnNumber || selected.ocid}</div>
@@ -649,11 +655,8 @@ function Home() {
               <MRow label="Method" value={selected.method || '—'} />
               {selected.methodDetail && <MRow label="Detail" value={selected.methodDetail} />}
             </ModalSection>
-            <div className="px-5 sm:px-6 py-4 border-t border-gray-100 flex items-center justify-between">
-              <a href={selected.austenderUrl} target="_blank" rel="noopener noreferrer"
-                className="text-xs font-semibold text-blue-600 hover:underline">
-                View on AusTender →
-              </a>
+            <div className="px-5 sm:px-6 py-4 border-t border-gray-100">
+              <a href={selected.austenderUrl} target="_blank" rel="noopener noreferrer" className="text-xs font-semibold text-blue-600 hover:underline">View on AusTender →</a>
             </div>
           </div>
         </div>
